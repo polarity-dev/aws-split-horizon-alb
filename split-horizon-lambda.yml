@@ -1,0 +1,622 @@
+AWSTemplateFormatVersion: 2010-09-09
+
+Description: >
+  Standalone split-horizon DNS solution. Deploys a Lambda that keeps a private
+  Route 53 A record in sync with the private IPs of an internet-facing ALB.
+  No dependency on other CloudFormation stacks. Works with any existing VPC and ALB.
+
+
+Parameters:
+
+### Load Balancer ###
+  pAlbPublicDnsName:
+    Type: String
+    Description: Default Public ALB DNS name (e.g. my-alb-123456.eu-west-1.elb.amazonaws.com).
+    AllowedPattern: ^[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?)*\.[a-zA-Z]{2,}$
+    ConstraintDescription: Must be a valid DNS name (e.g. my-alb-123456.eu-west-1.elb.amazonaws.com).
+
+  pCustomAlbPrivateDnsName:
+    Type: String
+    Description: Custom private DNS name for the ALB (e.g. lb.internal.example.com).
+    AllowedPattern: ^[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?)*\.[a-zA-Z]{2,}$
+    ConstraintDescription: Must be a valid DNS name (e.g. lb.internal.example.com).
+
+
+### Lambda ###
+  pLambdaTimeoutSeconds:
+    Type: Number
+    Description: Timeout in seconds for the split-horizon Lambda. Lower it when using an external invoker with a shorter interval to avoid overlapping executions.
+    Default: 60
+    MinValue: 5
+    MaxValue: 900
+
+
+### Schedule ###
+  pEnableSchedule:
+    Type: String
+    Description: Whether to enable the built-in EventBridge schedule. Set to "false" when using an external invoker.
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+
+
+### Network ###
+  pVpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID where the private hosted zone will be associated.
+
+
+### Monitoring ###
+  pAlarmSnsTopicArn:
+    Type: String
+    Description: SNS Topic ARN for alarm notifications. Leave empty to disable alarm.
+    Default: ""
+
+  pLogRetentionInDays:
+    Type: Number
+    Description: Retention period in days for the split-horizon Lambda log group.
+    Default: 7
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288, 3653]
+
+
+### Tagging ###
+  pEnvironmentTag:
+    Type: String
+    Description: Environment for default resource tagging.
+    Default: production
+    AllowedValues:
+      - production
+      - staging
+      - sandbox
+      - test
+      - development
+      - qa
+
+
+Metadata:
+
+  AWS::CloudFormation::Interface:
+
+    ParameterLabels:
+      pAlbPublicDnsName:
+        default: ALB Public DNS Name
+      pCustomAlbPrivateDnsName:
+        default: Custom ALB Private DNS Name (Split Horizon)
+      pVpcId:
+        default: VPC ID
+      pAlarmSnsTopicArn:
+        default: Alarm SNS Topic
+      pLogRetentionInDays:
+        default: Log Retention
+      pLambdaTimeoutSeconds:
+        default: Lambda Timeout
+      pEnableSchedule:
+        default: Enable Built-in Schedule
+      pEnvironmentTag:
+        default: Environment Tag
+
+    ParameterGroups:
+      - Label:
+          default: Load Balancer Settings
+        Parameters:
+          - pAlbPublicDnsName
+          - pCustomAlbPrivateDnsName
+      - Label:
+          default: Network Settings
+        Parameters:
+            - pVpcId
+      - Label:
+          default: Lambda Settings
+        Parameters:
+          - pLambdaTimeoutSeconds
+      - Label:
+          default: Schedule
+        Parameters:
+          - pEnableSchedule
+      - Label:
+          default: Monitoring
+        Parameters:
+          - pAlarmSnsTopicArn
+          - pLogRetentionInDays
+      - Label:
+          default: Tagging
+        Parameters:
+          - pEnvironmentTag
+
+
+Conditions:
+
+  CondEnableAlarm: !Not [!Equals ["", !Ref pAlarmSnsTopicArn]]
+  CondEnableSchedule: !Equals ["true", !Ref pEnableSchedule]
+
+
+Resources:
+
+### Private Hosted Zone and default Record ###
+  PrivateHostedZone:
+    Type: AWS::Route53::HostedZone
+    Properties:
+      Name: !Ref pCustomAlbPrivateDnsName
+      VPCs:
+        - VPCId: !Ref pVpcId
+          VPCRegion: !Ref AWS::Region
+      HostedZoneTags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-private-hosted-zone
+        - Key: Controlled-by
+          Value: !Sub cloudformation-${AWS::StackName}
+        - Key: Environment
+          Value: !Ref pEnvironmentTag
+
+  PrivateRecordA:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref PrivateHostedZone
+      Name: !Ref pCustomAlbPrivateDnsName
+      Type: A
+      TTL: 60
+      ResourceRecords:
+        - 10.1.2.3
+        - 10.4.5.6
+
+
+### Split Horizon Lambda ###
+  SplitHorizonLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-sh-lambda-${AWS::Region}
+      Description: Lets the split-horizon Lambda read ALB ENIs and update the private A record in this stack's hosted zone.
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+      Policies:
+        - PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Effect: Allow
+                Resource:
+                  - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-split-horizon:*
+              - Action:
+                  - ec2:DescribeNetworkInterfaces
+                Effect: Allow
+                Resource:
+                  - "*"
+              - Action:
+                  - route53:ListResourceRecordSets
+                  - route53:ChangeResourceRecordSets
+                Effect: Allow
+                Resource:
+                  - !Sub arn:${AWS::Partition}:route53:::hostedzone/${PrivateHostedZone}
+          PolicyName: !Sub ${AWS::StackName}-sh-lambda
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-split-horizon-lambda
+        - Key: Controlled-by
+          Value: !Sub cloudformation-${AWS::StackName}
+        - Key: Environment
+          Value: !Ref pEnvironmentTag
+
+  SplitHorizonLambda:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - PrivateRecordA
+      - RestoreSeedRecordInvoke
+    Properties:
+      Description: Lambda to update internal DNS record with ALB private IPs
+      Handler: index.handler
+      MemorySize: 256
+      Timeout: !Ref pLambdaTimeoutSeconds
+      Role: !GetAtt SplitHorizonLambdaRole.Arn
+      Runtime: nodejs24.x
+      LoggingConfig:
+        LogGroup: !Ref SplitHorizonLambdaLogGroup
+      Environment:
+        Variables:
+          ALB_DNS_NAME: !Ref pAlbPublicDnsName
+          CUSTOM_DNS_NAME: !Ref pCustomAlbPrivateDnsName
+          HOSTED_ZONE_ID: !Ref PrivateHostedZone
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-split-horizon
+        - Key: Controlled-by
+          Value: !Sub cloudformation-${AWS::StackName}
+        - Key: Environment
+          Value: !Ref pEnvironmentTag
+      Code:
+        ZipFile: |
+          const dns = require("dns").promises;
+          const { EC2Client, DescribeNetworkInterfacesCommand } = require("@aws-sdk/client-ec2");
+          const { Route53Client, ListResourceRecordSetsCommand, ChangeResourceRecordSetsCommand } = require("@aws-sdk/client-route-53");
+
+          // CLIENTS INSTANTIATIONS
+          const r53client = new Route53Client({ region: process.env.AWS_REGION });
+          const ec2Client = new EC2Client({ region: process.env.AWS_REGION });
+
+          // FUNCTION TO CHECK EQUALITY BETWEEN ARRAYS
+          const areArrayEquals = (a, b) => {
+              if (a.length !== b.length){
+                  return false;
+              }
+              return a.every((value, index) => value === b[index]);
+          };
+
+          // CACHED ARRAY OF ALB PUBLIC IPs
+          let cachedAlbPublicIps = [];
+
+          //LAMBDA FUNCTION
+          exports.handler = async (event) => {
+              try {
+                  // DNS QUERY AND CACHE CHECK
+                  const albPublicIps = (await dns.resolve4(process.env.ALB_DNS_NAME)).sort();
+
+                  if (areArrayEquals(albPublicIps, cachedAlbPublicIps)) {
+                      console.log("Cache not changed");
+                      return;
+                  };
+
+                  // LIST ALB ENIs FILTERED BY PUBLIC IPs AND GET THEIR PRIVATE IPs
+                  const describeInterfacesInput = {
+                      Filters: [
+                        {
+                          Name: "association.public-ip",
+                          Values: albPublicIps
+                        }
+                      ]
+                  };
+                  const describeInterfacesCmd = new DescribeNetworkInterfacesCommand(describeInterfacesInput);
+
+                  let continuation = true;
+                  const interfaces = [];
+                  while (continuation) {
+                      const { NetworkInterfaces, NextToken } = await ec2Client.send(describeInterfacesCmd);
+                      continuation = NextToken;
+                      describeInterfacesCmd.input.NextToken = NextToken;
+                      interfaces.push(...NetworkInterfaces);
+                  };
+                  const albPrivateIps = interfaces.map(eni => eni.PrivateIpAddress).sort();
+
+                  console.log("ALB pubIPs:", albPublicIps);
+                  console.log("ALB privIPs:", albPrivateIps);
+
+                  if (albPrivateIps.length === 0) {
+                      throw new Error(`No ENIs found for the public IPs of ${process.env.ALB_DNS_NAME} (${albPublicIps}). Check that the ALB is internet-facing and lives in this account and region.`);
+                  };
+
+                  // CHECK IF PRIVATE IPs ARE DIFFERENT FROM INTERNAL DNS RECORD (this because AWS can destroy Lambda exec env and flush the cachedAlbPublicIps cache)
+                  // https://docs.aws.amazon.com/lambda/latest/dg/lambda-runtime-environment.html
+                  const listRecordsInput = {
+                      HostedZoneId: process.env.HOSTED_ZONE_ID,
+                      StartRecordName: process.env.CUSTOM_DNS_NAME,
+                      StartRecordType: "A",
+                      MaxItems: 1
+                  };
+                  const listRecordsCommand = new ListResourceRecordSetsCommand(listRecordsInput);
+                  const {ResourceRecordSets} = await r53client.send(listRecordsCommand);
+                  const record = ResourceRecordSets[0];
+                  const r53privateIps = (record?.Type === "A" && record?.ResourceRecords)
+                      ? record.ResourceRecords.map(address => address.Value).sort()
+                      : [];
+                  console.log("Internal DNS privIPs:", r53privateIps);
+
+                  if (areArrayEquals(albPrivateIps, r53privateIps)) {
+                      console.log("Alb private IPs not changed");
+                      cachedAlbPublicIps = [...albPublicIps];
+                      return;
+                  };
+
+                  // CHANGE INTERNAL DNS RECORD SET
+                  const changeRecordInput = {
+                      ChangeBatch: {
+                          Changes: [{
+                              Action: "UPSERT",
+                              ResourceRecordSet: {
+                                Name: process.env.CUSTOM_DNS_NAME,
+                                Type: "A",
+                                TTL: 60,
+                                ResourceRecords: albPrivateIps.map(privateIp => ({ Value: privateIp }))
+                              }
+                          }]
+                      },
+                      HostedZoneId: process.env.HOSTED_ZONE_ID
+                  };
+                  const changeRecordCommand = new ChangeResourceRecordSetsCommand(changeRecordInput);
+                  const changeRecordResponse = await r53client.send(changeRecordCommand);
+                  console.log(changeRecordResponse);
+
+                  // CACHE AFTER ROUTE 53 ACCEPTS THE CHANGE (propagation may still be PENDING)
+                  cachedAlbPublicIps = [...albPublicIps];
+
+              } catch (error) {
+                  console.log(error);
+                  throw error;
+              }
+          }
+
+  SplitHorizonLambdaLogGroup:
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-split-horizon
+      RetentionInDays: !Ref pLogRetentionInDays
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-split-horizon-lambda
+        - Key: Controlled-by
+          Value: !Sub cloudformation-${AWS::StackName}
+        - Key: Environment
+          Value: !Ref pEnvironmentTag
+
+
+### EventBridge Scheduler ###
+  SchedulerInvokeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-sh-scheduler-${AWS::Region}
+      Description: Lets EventBridge Scheduler invoke the split-horizon Lambda.
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - scheduler.amazonaws.com
+      Policies:
+        - PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Action:
+                  - lambda:InvokeFunction
+                Effect: Allow
+                Resource:
+                  - !GetAtt SplitHorizonLambda.Arn
+          PolicyName: !Sub ${AWS::StackName}-sh-scheduler
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-scheduler-invoke
+        - Key: Controlled-by
+          Value: !Sub cloudformation-${AWS::StackName}
+        - Key: Environment
+          Value: !Ref pEnvironmentTag
+
+  SplitHorizonSchedule:
+    Type: AWS::Scheduler::Schedule
+    DependsOn: RestoreSeedRecordInvoke
+    Properties:
+      Description: Invokes split-horizon Lambda every minute
+      ScheduleExpression: rate(1 minute)
+      State: !If [CondEnableSchedule, ENABLED, DISABLED]
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: !GetAtt SplitHorizonLambda.Arn
+        RoleArn: !GetAtt SchedulerInvokeRole.Arn
+        RetryPolicy:
+          MaximumRetryAttempts: 0
+
+
+### Custom resource to restore the seed record on stack deletion and update ###
+  RestoreSeedRecordFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-sh-restore-${AWS::Region}
+      Description: Lets the restore function put the seed record back so CloudFormation can delete it.
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub ${AWS::StackName}-sh-restore
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Sid: Logs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-restore-seed-record:*
+              - Sid: Route53
+                Effect: Allow
+                Action:
+                  - route53:ChangeResourceRecordSets
+                Resource:
+                  - !Sub arn:${AWS::Partition}:route53:::hostedzone/*
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-restore-seed-record-lambda
+        - Key: Controlled-by
+          Value: !Sub cloudformation-${AWS::StackName}
+        - Key: Environment
+          Value: !Ref pEnvironmentTag
+
+  RestoreSeedRecordFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Function to restore the seed record so CloudFormation can delete it
+      Handler: index.handler
+      Runtime: nodejs24.x
+      Role: !GetAtt RestoreSeedRecordFunctionRole.Arn
+      Timeout: 60
+      LoggingConfig:
+        LogGroup: !Ref RestoreSeedRecordLambdaLogGroup
+      Environment:
+        Variables:
+          LAMBDA_TIMEOUT: 60
+          SEED_IPS: 10.1.2.3,10.4.5.6
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-restore-seed-record
+        - Key: Controlled-by
+          Value: !Sub cloudformation-${AWS::StackName}
+        - Key: Environment
+          Value: !Ref pEnvironmentTag
+      Code:
+        ZipFile: |
+          const { Route53Client, ChangeResourceRecordSetsCommand } = require("@aws-sdk/client-route-53");
+          const cfnResponse = require("cfn-response");
+
+          const timeout = parseInt(process.env.LAMBDA_TIMEOUT) || 60
+
+          exports.handler = async (event, context) => {
+
+              console.log(event);
+
+              const t = setTimeout(() => {
+                  console.log("Lambda went on timeout!");
+                  return cfnResponse.send(event, context, cfnResponse.FAILED);
+              }, 1000 * (timeout - 2));
+
+              try {
+
+                  if (event?.RequestType === "Delete" || event?.RequestType === "Update") {
+                      console.log(`Called "${event.RequestType}" on resource`);
+
+                      // On Delete: restore seed on current zone so CFN can delete the record.
+                      // On Update: restore seed on the OLD zone (about to be replaced) so CFN
+                      // can delete the old record and hosted zone during the replacement.
+                      const props = event.RequestType === "Delete"
+                          ? event.ResourceProperties
+                          : event.OldResourceProperties;
+
+                      const client = new Route53Client({ region: process.env.AWS_REGION });
+                      const seedIps = process.env.SEED_IPS.split(",").map(ip => ip.trim()).filter(Boolean);
+                      const changeInput = {
+                          ChangeBatch: {
+                              Changes: [{
+                                  Action: "UPSERT",
+                                  ResourceRecordSet: {
+                                      Name: props.CustomDnsName,
+                                      Type: "A",
+                                      TTL: 60,
+                                      ResourceRecords: seedIps.map(ip => ({ Value: ip }))
+                                  }
+                              }]
+                          },
+                          HostedZoneId: props.HostedZoneId
+                      };
+                      console.log(await client.send(new ChangeResourceRecordSetsCommand(changeInput)));
+                      console.log("Seed record restored:", seedIps, "on zone", props.HostedZoneId);
+                      clearTimeout(t);
+                      return cfnResponse.send(event, context, cfnResponse.SUCCESS);
+                  }
+                  else {
+                      clearTimeout(t);
+                      return cfnResponse.send(event, context, cfnResponse.SUCCESS);
+                  }
+
+              } catch (error) {
+                  console.log(error);
+                  clearTimeout(t);
+                  return cfnResponse.send(event, context, cfnResponse.FAILED);
+              }
+          }
+
+  RestoreSeedRecordLambdaLogGroup:
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-restore-seed-record
+      RetentionInDays: 7
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-restore-seed-record-lambda
+        - Key: Controlled-by
+          Value: !Sub cloudformation-${AWS::StackName}
+        - Key: Environment
+          Value: !Ref pEnvironmentTag
+
+  RestoreSeedRecordInvoke:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn:
+      - RestoreSeedRecordLambdaLogGroup
+      - PrivateRecordA
+    Properties:
+      ServiceToken: !GetAtt RestoreSeedRecordFunction.Arn
+      CustomDnsName: !Ref pCustomAlbPrivateDnsName
+      HostedZoneId: !Ref PrivateHostedZone
+
+
+### Split Horizon Lambda Alarm ###
+  SplitHorizonLambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CondEnableAlarm
+    Properties:
+      AlarmName: !Sub ${AWS::StackName}-split-horizon-errors
+      AlarmDescription: Split Horizon Lambda has failed 5 times in 5 minutes
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref SplitHorizonLambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref pAlarmSnsTopicArn
+      OKActions:
+        - !Ref pAlarmSnsTopicArn
+
+  SplitHorizonLambdaNoInvocationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CondEnableAlarm
+    DependsOn: SplitHorizonSchedule
+    Properties:
+      AlarmName: !Sub ${AWS::StackName}-split-horizon-not-running
+      AlarmDescription: Split Horizon Lambda has not been invoked in the last 5 minutes
+      Namespace: AWS/Lambda
+      MetricName: Invocations
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref SplitHorizonLambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      AlarmActions:
+        - !Ref pAlarmSnsTopicArn
+      OKActions:
+        - !Ref pAlarmSnsTopicArn
+
+
+Outputs:
+
+  CustomAlbName:
+    Value: !Ref pCustomAlbPrivateDnsName
+    Description: Custom ALB Name for Private DNS
+    Export:
+      Name: !Sub ${AWS::StackName}-CustomAlbName
+
+  PrivateHostedZoneId:
+    Value: !Ref PrivateHostedZone
+    Description: Private Hosted Zone ID
+    Export:
+      Name: !Sub ${AWS::StackName}-PrivateHostedZoneId
+
+  SplitHorizonLambdaArn:
+    Value: !GetAtt SplitHorizonLambda.Arn
+    Description: Split Horizon Lambda ARN
+    Export:
+      Name: !Sub ${AWS::StackName}-SplitHorizonLambdaArn
